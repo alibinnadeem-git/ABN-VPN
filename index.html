@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ABN VPN Control Plane</title>
+  <meta name="description" content="ABN VPN serverless control plane with WireGuard data plane." />
+  <style>
+    :root { color-scheme: dark; --bg:#081018; --panel:#0d1823; --panel2:#101e2b; --text:#edf7ff; --muted:#91a6b8; --line:#1e3547; --ok:#4ade80; --warn:#fbbf24; --bad:#fb7185; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:radial-gradient(circle at top left,#10283a 0,#081018 42%); color:var(--text); min-height:100vh; }
+    main { max-width:1080px; margin:0 auto; padding:56px 24px 72px; }
+    .eyebrow { text-transform:uppercase; letter-spacing:.18em; font-size:12px; color:#78d7ff; font-weight:800; }
+    h1 { font-size:clamp(40px,7vw,72px); line-height:.98; margin:12px 0 18px; letter-spacing:-.04em; }
+    .lead { max-width:790px; color:var(--muted); line-height:1.7; font-size:18px; }
+    .grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; margin-top:32px; }
+    .card { background:linear-gradient(180deg,var(--panel2),var(--panel)); border:1px solid var(--line); border-radius:18px; padding:20px; box-shadow:0 18px 50px rgba(0,0,0,.18); }
+    .label { color:var(--muted); font-size:13px; }
+    .value { font-size:24px; font-weight:800; margin-top:6px; }
+    .statusbar { margin-top:18px; display:flex; gap:10px; flex-wrap:wrap; }
+    .pill { display:inline-flex; align-items:center; gap:8px; border:1px solid var(--line); background:#08131d; border-radius:999px; padding:9px 12px; font-size:13px; }
+    .dot { width:8px; height:8px; border-radius:50%; background:var(--warn); box-shadow:0 0 14px currentColor; }
+    .dot.ok { background:var(--ok); }
+    .dot.bad { background:var(--bad); }
+    .section { margin-top:28px; }
+    #nodes { margin-top:12px; }
+    .node { display:flex; justify-content:space-between; gap:20px; align-items:center; padding:14px 0; border-top:1px solid var(--line); }
+    .node:first-child { border-top:0; }
+    .node-status { font-weight:800; text-transform:uppercase; font-size:12px; letter-spacing:.08em; }
+    code { color:#c9efff; }
+    .checklist { margin:10px 0 0; padding-left:20px; color:var(--muted); line-height:1.8; }
+    .checklist strong { color:var(--text); }
+    footer { margin-top:42px; color:var(--muted); font-size:13px; }
+    @media (max-width:800px){ .grid{grid-template-columns:1fr;} main{padding-top:36px;} }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">ABN VPN · Production Control Plane</div>
+  <h1>Serverless control.<br>WireGuard data plane.</h1>
+  <p class="lead">The management layer is deployed on Netlify. The actual VPN tunnel will run on persistent WireGuard compute. The zero-cost-first target is an Oracle Cloud Always Free eligible node in <code>us-sanjose-1</code>.</p>
+
+  <div class="grid">
+    <section class="card"><div class="label">Control plane</div><div class="value">Netlify</div><p class="label">Static dashboard + serverless APIs.</p></section>
+    <section class="card"><div class="label">Tunnel engine</div><div class="value">WireGuard</div><p class="label">Persistent encrypted data plane.</p></section>
+    <section class="card"><div class="label">First target node</div><div class="value">Oracle Cloud</div><p class="label"><code>us-sanjose-1</code> · zero-cost-first.</p></section>
+  </div>
+
+  <section class="card section">
+    <div class="label">Production status</div>
+    <div class="statusbar">
+      <div class="pill"><span id="controlDot" class="dot"></span><span id="health">Checking control plane…</span></div>
+      <div class="pill"><span id="nodeDot" class="dot"></span><span id="nodeHealth">Checking VPN node…</span></div>
+    </div>
+    <div id="nodes"></div>
+  </section>
+
+  <section class="card section">
+    <div class="label">Next activation steps</div>
+    <ol class="checklist">
+      <li><strong>Create Oracle VM</strong> in the tenancy home region, preferably San Jose.</li>
+      <li><strong>Run the first-node bootstrap</strong> from this repository.</li>
+      <li><strong>Open UDP 51820</strong> in OCI VCN/NSG and the VM firewall.</li>
+      <li><strong>Register public node metadata</strong> in Netlify environment variables.</li>
+      <li><strong>Scan the generated QR</strong> in the WireGuard iOS/Android app and verify public IP changes.</li>
+    </ol>
+  </section>
+
+  <footer>ABN VPN control plane · v0.5 · Private keys belong only on the VPN server or client device.</footer>
+</main>
+<script>
+  const health = document.getElementById('health');
+  const nodeHealth = document.getElementById('nodeHealth');
+  const nodes = document.getElementById('nodes');
+  const controlDot = document.getElementById('controlDot');
+  const nodeDot = document.getElementById('nodeDot');
+
+  function setDot(el, state) {
+    el.className = 'dot' + (state === 'ok' ? ' ok' : state === 'bad' ? ' bad' : '');
+  }
+
+  async function loadStatus() {
+    try {
+      const [h, n, nh] = await Promise.all([
+        fetch('/api/health', {cache:'no-store'}).then(r => r.json()),
+        fetch('/api/nodes', {cache:'no-store'}).then(r => r.json()),
+        fetch('/api/node-health', {cache:'no-store'}).then(r => r.json())
+      ]);
+      health.textContent = h.ok ? 'Netlify control plane ONLINE' : 'Control plane DEGRADED';
+      setDot(controlDot, h.ok ? 'ok' : 'bad');
+
+      if (!nh.configured) {
+        nodeHealth.textContent = 'WireGuard node SETUP REQUIRED';
+        setDot(nodeDot, 'warn');
+      } else {
+        const extra = nh.lastSeen ? ` · last seen ${nh.heartbeatAgeSeconds}s ago · peers ${nh.activePeerCount ?? 0}/${nh.peerCount ?? 0}` : '';
+        nodeHealth.textContent = `WireGuard node ${String(nh.status || 'unknown').toUpperCase()}${extra}`;
+        setDot(nodeDot, nh.status === 'online' ? 'ok' : nh.status === 'degraded' ? 'warn' : 'bad');
+      }
+
+      nodes.innerHTML = (n.nodes || []).map(x => {
+        const heartbeatStatus = nh.configured && nh.nodeId && x.id === nh.nodeId ? nh.status : null;
+        const status = String(heartbeatStatus || x.status || 'unknown');
+        return `<div class="node"><div><strong>${x.name || x.id || 'VPN node'}</strong><div class="label">${x.provider || ''}${x.region ? ' · ' + x.region : ''}${x.endpoint ? ' · ' + x.endpoint : ''}</div></div><div class="node-status">${status}</div></div>`;
+      }).join('') || '<div class="node"><div>No VPN nodes registered.</div><div class="node-status">setup required</div></div>';
+    } catch (e) {
+      health.textContent = 'Control plane status unavailable';
+      nodeHealth.textContent = 'VPN node status unavailable';
+      nodes.textContent = 'Could not load node inventory.';
+      setDot(controlDot, 'bad');
+      setDot(nodeDot, 'bad');
+    }
+  }
+  loadStatus();
+</script>
+</body>
+</html>

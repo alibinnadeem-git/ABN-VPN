@@ -1,0 +1,15 @@
+.env
+.env.local
+*.conf
+*.key
+*.pem
+*.p12
+client-configs/
+node_modules/
+.vercel/
+.DS_Store
+.netlify/
+*.conf
+*.key
+*.private
+client-*.png
