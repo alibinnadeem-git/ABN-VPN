@@ -1,0 +1,267 @@
+name: Provision Oracle VPN Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: OCI region
+        required: true
+        default: us-sanjose-1
+        type: string
+      client_name:
+        description: First WireGuard client profile name
+        required: true
+        default: ali-iphone
+        type: string
+      control_plane_url:
+        description: ABN VPN Netlify control plane URL
+        required: true
+        default: https://abn-vpn.netlify.app
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: oracle-vpn-provisioning
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+      TF_VAR_user_ocid: ${{ secrets.OCI_USER_OCID }}
+      TF_VAR_fingerprint: ${{ secrets.OCI_FINGERPRINT }}
+      TF_VAR_private_key: ${{ secrets.OCI_PRIVATE_KEY }}
+      TF_VAR_compartment_ocid: ${{ secrets.OCI_COMPARTMENT_OCID }}
+      TF_VAR_region: ${{ inputs.region }}
+      VPN_NODE_HEARTBEAT_TOKEN: ${{ secrets.VPN_NODE_HEARTBEAT_TOKEN }}
+      VPN_PROFILE_PASSPHRASE: ${{ secrets.VPN_PROFILE_PASSPHRASE }}
+      TERRAFORM_STATE_PASSPHRASE: ${{ secrets.TERRAFORM_STATE_PASSPHRASE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in \
+            TF_VAR_tenancy_ocid TF_VAR_user_ocid TF_VAR_fingerprint \
+            TF_VAR_private_key TF_VAR_compartment_ocid \
+            VPN_NODE_HEARTBEAT_TOKEN VPN_PROFILE_PASSPHRASE \
+            TERRAFORM_STATE_PASSPHRASE
+          do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required secret-backed variable is missing: $name"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.4
+          terraform_wrapper: false
+
+      - name: Restore encrypted Terraform state if available
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/abn-state
+          previous_run_id="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/provision-oracle.yml/runs?status=success&branch=main&per_page=1" \
+            --jq '.workflow_runs[0].id // empty' 2>/dev/null || true)"
+          if [[ -n "$previous_run_id" ]]; then
+            gh run download "$previous_run_id" \
+              --repo "$GITHUB_REPOSITORY" \
+              -n oracle-terraform-state \
+              -D /tmp/abn-state || true
+          fi
+          if [[ -s /tmp/abn-state/terraform.tfstate.enc ]]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 \
+              -in /tmp/abn-state/terraform.tfstate.enc \
+              -out infra/oracle-cloud/terraform/terraform.tfstate \
+              -pass env:TERRAFORM_STATE_PASSPHRASE
+            echo "Previous encrypted Terraform state restored."
+          else
+            echo "No prior Terraform state artifact found; this will be a first provision."
+          fi
+
+      - name: Create ephemeral provisioning SSH key
+        run: |
+          set -euo pipefail
+          ssh-keygen -t ed25519 -N "" -f /tmp/abn-vpn-ssh -C "abn-vpn-github-actions"
+          runner_ip="$(curl -fsS --retry 3 https://api.ipify.org)"
+          [[ "$runner_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          {
+            echo "TF_VAR_ssh_public_key=$(cat /tmp/abn-vpn-ssh.pub)"
+            echo "TF_VAR_ssh_source_cidr=${runner_ip}/32"
+          } >> "$GITHUB_ENV"
+
+      - name: Terraform validate
+        working-directory: infra/oracle-cloud/terraform
+        run: |
+          set -euo pipefail
+          terraform fmt -check
+          terraform init
+          terraform validate
+
+      - name: Provision Oracle infrastructure
+        working-directory: infra/oracle-cloud/terraform
+        run: |
+          set -euo pipefail
+          terraform apply -auto-approve
+          public_ip="$(terraform output -raw public_ip)"
+          echo "public_ip=$public_ip" >> "$GITHUB_OUTPUT"
+        id: terraform
+
+      - name: Wait for SSH
+        env:
+          PUBLIC_IP: ${{ steps.terraform.outputs.public_ip }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan -H "$PUBLIC_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
+          for attempt in {1..40}; do
+            if ssh -o BatchMode=yes -o ConnectTimeout=5 \
+              -i /tmp/abn-vpn-ssh "ubuntu@${PUBLIC_IP}" true 2>/dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Oracle VM did not become reachable over temporary SSH."
+          exit 1
+
+      - name: Copy reviewed WireGuard scripts
+        env:
+          PUBLIC_IP: ${{ steps.terraform.outputs.public_ip }}
+        run: |
+          set -euo pipefail
+          ssh -i /tmp/abn-vpn-ssh "ubuntu@${PUBLIC_IP}" \
+            'mkdir -p /tmp/abn-vpn'
+          scp -i /tmp/abn-vpn-ssh infra/oracle-cloud/*.sh \
+            "ubuntu@${PUBLIC_IP}:/tmp/abn-vpn/"
+          ssh -i /tmp/abn-vpn-ssh "ubuntu@${PUBLIC_IP}" \
+            'sudo mkdir -p /opt/abn-vpn && sudo cp /tmp/abn-vpn/*.sh /opt/abn-vpn/ && sudo chmod 700 /opt/abn-vpn/*.sh'
+
+      - name: Bootstrap WireGuard without exposing client private material
+        env:
+          PUBLIC_IP: ${{ steps.terraform.outputs.public_ip }}
+          CLIENT_NAME: ${{ inputs.client_name }}
+          CONTROL_PLANE_URL: ${{ inputs.control_plane_url }}
+          NODE_ID: ${{ inputs.region }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$VPN_NODE_HEARTBEAT_TOKEN" > /tmp/heartbeat-token
+          chmod 600 /tmp/heartbeat-token
+          scp -q -i /tmp/abn-vpn-ssh /tmp/heartbeat-token \
+            "ubuntu@${PUBLIC_IP}:/tmp/heartbeat-token"
+
+          if ! ssh -i /tmp/abn-vpn-ssh "ubuntu@${PUBLIC_IP}" \
+            "TOKEN=\$(cat /tmp/heartbeat-token); \
+             cd /opt/abn-vpn; \
+             sudo env ABN_CONTROL_PLANE_URL='${CONTROL_PLANE_URL}' \
+               ABN_HEARTBEAT_TOKEN=\"\$TOKEN\" \
+               ABN_NODE_ID='${NODE_ID}' \
+               ./bootstrap-first-node.sh '${PUBLIC_IP}' '${CLIENT_NAME}' '10.77.0.2/32' \
+               >/tmp/abn-bootstrap.log 2>&1; \
+             rc=\$?; \
+             shred -u /tmp/heartbeat-token 2>/dev/null || rm -f /tmp/heartbeat-token; \
+             exit \$rc"
+          then
+            echo "::error::WireGuard bootstrap failed. Private bootstrap output was intentionally not printed."
+            exit 1
+          fi
+
+      - name: Verify node
+        env:
+          PUBLIC_IP: ${{ steps.terraform.outputs.public_ip }}
+        run: |
+          set -euo pipefail
+          ssh -i /tmp/abn-vpn-ssh "ubuntu@${PUBLIC_IP}" \
+            'sudo /opt/abn-vpn/verify-node.sh'
+
+      - name: Retrieve and encrypt first client profile
+        env:
+          PUBLIC_IP: ${{ steps.terraform.outputs.public_ip }}
+          CLIENT_NAME: ${{ inputs.client_name }}
+        run: |
+          set -euo pipefail
+          umask 077
+          ssh -i /tmp/abn-vpn-ssh "ubuntu@${PUBLIC_IP}" \
+            "sudo cat /root/client-configs/${CLIENT_NAME}.conf" \
+            > /tmp/abn-client.conf
+
+          openssl enc -aes-256-cbc -pbkdf2 -salt \
+            -in /tmp/abn-client.conf \
+            -out /tmp/abn-client.conf.enc \
+            -pass env:VPN_PROFILE_PASSPHRASE
+
+          shred -u /tmp/abn-client.conf
+
+      - name: Upload encrypted first client profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: abn-vpn-first-client-encrypted
+          path: /tmp/abn-client.conf.enc
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Close public SSH ingress
+        working-directory: infra/oracle-cloud/terraform
+        run: |
+          set -euo pipefail
+          export TF_VAR_ssh_source_cidr="127.0.0.1/32"
+          terraform apply -auto-approve
+
+      - name: Encrypt Terraform state
+        working-directory: infra/oracle-cloud/terraform
+        run: |
+          set -euo pipefail
+          test -s terraform.tfstate
+          openssl enc -aes-256-cbc -pbkdf2 -salt \
+            -in terraform.tfstate \
+            -out /tmp/terraform.tfstate.enc \
+            -pass env:TERRAFORM_STATE_PASSPHRASE
+
+      - name: Upload encrypted Terraform state
+        uses: actions/upload-artifact@v4
+        with:
+          name: oracle-terraform-state
+          path: /tmp/terraform.tfstate.enc
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Provisioning summary
+        env:
+          PUBLIC_IP: ${{ steps.terraform.outputs.public_ip }}
+        run: |
+          {
+            echo "## ABN VPN Oracle node"
+            echo
+            echo "- Region: \`${{ inputs.region }}\`"
+            echo "- Public IP: \`$PUBLIC_IP\`"
+            echo "- WireGuard: \`UDP/51820\`"
+            echo "- SSH: closed after provisioning"
+            echo "- Client profile: encrypted one-day Actions artifact"
+            echo "- Netlify heartbeat: installed"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup local secret material
+        if: always()
+        run: |
+          shred -u /tmp/abn-vpn-ssh 2>/dev/null || rm -f /tmp/abn-vpn-ssh
+          rm -f /tmp/abn-vpn-ssh.pub /tmp/heartbeat-token /tmp/abn-client.conf
