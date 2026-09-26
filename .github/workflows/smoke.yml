@@ -14,4 +14,16 @@ jobs:
       - run: bash -n infra/oracle-cloud/init-wireguard.sh
       - run: bash -n infra/oracle-cloud/add-client.sh
       - run: bash -n infra/oracle-cloud/remove-client.sh
-      - run: bash -n infra/oracle-cloud/healthcheck.sh
+      - run: bash -n infra/oracle-cloud/bootstrap-first-node.sh
+      - run: bash -n infra/oracle-cloud/install-heartbeat.sh
+      - run: bash -n infra/oracle-cloud/verify-node.sh
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.4
+          terraform_wrapper: false
+      - name: Validate Oracle Terraform
+        working-directory: infra/oracle-cloud/terraform
+        run: |
+          terraform fmt -check
+          terraform init -backend=false
+          terraform validate
